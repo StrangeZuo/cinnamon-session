@@ -1,8 +1,9 @@
 # https://github.com/linuxmint/cinnamon-session
-project('cinnamon-session',
-  [ 'c', ],
-  version: '5.0.1',
-  meson_version: '>=0.37.0',
+project(
+  'cinnamon-session',
+  ['c'],
+version : '6.2.1',
+meson_version : '>=0.56.0'
 )
 
 ################################################################################
@@ -41,14 +42,7 @@ xapp        = dependency('xapp', version: '>=1.0.4')
 xau         = dependency('xau')
 xcomposite  = dependency('xcomposite')
 gl          = dependency('gl')
-
-if get_option('gconf')
-  gconf     = dependency('gconf-2.0')
-else
-  gconf     = dependency('', required: false)
-endif
-conf.set('HAVE_GCONF', gconf.found())
-
+cinnamon_desktop = dependency('cinnamon-desktop', version: '>=6.0.0')
 
 gio_unix    = dependency('gio-unix-2.0',      required: false)
 libelogind  = dependency('libelogind',        required: false)
@@ -77,13 +71,6 @@ conf.set('HAVE_XTEST', xtest.found())
 
 xrender = dependency('xrender', required: false)
 conf.set('HAVE_XRENDER', xrender.found())
-
-docbook_enabled = get_option('docbook')
-if docbook_enabled
-  xmlto = find_program('xmlto')
-endif
-conf.set('DOCBOOK_DOCS_ENABLED', docbook_enabled)
-
 
 # Execinfo support
 conf.set10('HAVE_EXECINFO_H', cc.has_header('execinfo.h'))
@@ -136,13 +123,18 @@ conf.set('ENABLE_IPV6', have_ipv6)
 
 rootInclude = include_directories('.')
 
-conf.set_quoted('PKGDATADIR',         join_paths(get_option('prefix'), get_option('datadir'), meson.project_name()))
+dialog_dbus_address = 'unix:abstract=cinnamon-session-quit-dialog'
+pkg_datadir = join_paths(get_option('prefix'), get_option('datadir'), meson.project_name())
+
+conf.set_quoted('PKGDATADIR',         pkg_datadir)
 conf.set_quoted('LIBEXECDIR',         join_paths(get_option('prefix'), get_option('libexecdir')))
 conf.set_quoted('LOCALE_DIR',         join_paths(get_option('prefix'), get_option('localedir')))
 
 conf.set_quoted('PACKAGE', meson.project_name())
 conf.set_quoted('VERSION', meson.project_version())
 conf.set_quoted('GETTEXT_PACKAGE', meson.project_name())
+conf.set_quoted('DBUS_ADDRESS', dialog_dbus_address)
+
 
 configure_file(
   output: 'config.h',
@@ -157,12 +149,12 @@ add_project_arguments(project_cflags,
   language: 'c',
 )
 
-subdir('egg')
 subdir('cinnamon-session')
 subdir('data')
 subdir('doc')
 subdir('po')
 subdir('tools')
+subdir('cinnamon-session-quit')
 
 message('\n'.join([
 '',
@@ -177,18 +169,16 @@ message('\n'.join([
 '        sysconfdir:               @0@'.format(get_option('sysconfdir')),
 '        localstatedir:            @0@'.format(get_option('localstatedir')),
 '        datadir:                  @0@'.format(get_option('datadir')),
-'        source code location:     @0@'.format(meson.source_root()),
+'        source code location:     @0@'.format(meson.project_source_root()),
 '        compiler:                 @0@'.format(cc.get_id()),
 '        cflags:                   @0@'.format(project_cflags),
 #'        Maintainer mode:          @0@'.format(USE_MAINTAINER_MODE),
 #'        Use *_DISABLE_DEPRECATED: @0@'.format(enable_deprecation_flags),
 '',
-'        GConf support:            @0@'.format(gconf.found()),
 '        Logind support:           @0@'.format(logind.found()),
 '        IPv6 support:             @0@'.format(have_ipv6),
 '        Backtrace support:        @0@'.format(backtrace.found()),
 '        XRender support:          @0@'.format(xrender.found()),
 '        XTest support:            @0@'.format(xtest.found()),
-'        Build documentation:      @0@'.format(docbook_enabled),
 '',
 ]))

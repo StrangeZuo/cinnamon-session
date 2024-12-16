@@ -28,10 +28,7 @@
 
 #include <glib.h>
 #include <gio/gio.h>
-
-#ifdef HAVE_GCONF
-#include <gconf/gconf-client.h>
-#endif
+#include <gio/gdesktopappinfo.h>
 
 #include "csm-autostart-app.h"
 #include "csm-util.h"
@@ -45,9 +42,6 @@ enum {
         CSM_CONDITION_NONE           = 0,
         CSM_CONDITION_IF_EXISTS      = 1,
         CSM_CONDITION_UNLESS_EXISTS  = 2,
-#ifdef HAVE_GCONF
-        CSM_CONDITION_GNOME          = 3,
-#endif
         CSM_CONDITION_GSETTINGS      = 4,
         CSM_CONDITION_IF_SESSION     = 5,
         CSM_CONDITION_UNLESS_SESSION = 6,
@@ -61,7 +55,7 @@ struct _CsmAutostartAppPrivate {
         char                 *desktop_id;
         char                 *startup_id;
 
-        EggDesktopFile       *desktop_file;
+        GDesktopAppInfo      *app_info;
         /* provides defined in session definition */
         GSList               *session_provides;
 
@@ -127,18 +121,17 @@ is_disabled (CsmApp *app)
         priv = CSM_AUTOSTART_APP (app)->priv;
 
         /* CSM_AUTOSTART_APP_ENABLED_KEY key, used by old  */
-        if (egg_desktop_file_has_key (priv->desktop_file,
-                                      CSM_AUTOSTART_APP_ENABLED_KEY, NULL) &&
-            !egg_desktop_file_get_boolean (priv->desktop_file,
-                                           CSM_AUTOSTART_APP_ENABLED_KEY, NULL)) {
+        if (g_desktop_app_info_has_key (priv->app_info,
+                                        CSM_AUTOSTART_APP_ENABLED_KEY) &&
+            !g_desktop_app_info_get_boolean (priv->app_info,
+                                             CSM_AUTOSTART_APP_ENABLED_KEY)) {
                 g_debug ("app %s is disabled by " CSM_AUTOSTART_APP_ENABLED_KEY,
                          csm_app_peek_id (app));
                 return TRUE;
         }
 
         /* Hidden key, used by autostart spec */
-        if (egg_desktop_file_get_boolean (priv->desktop_file,
-                                          EGG_DESKTOP_FILE_KEY_HIDDEN, NULL)) {
+        if (g_desktop_app_info_get_is_hidden (priv->app_info)) {
                 g_debug ("app %s is disabled by Hidden",
                          csm_app_peek_id (app));
                 return TRUE;
@@ -146,13 +139,14 @@ is_disabled (CsmApp *app)
 
         /* Check OnlyShowIn/NotShowIn/TryExec */
         current_desktop = csm_util_get_current_desktop ();
-        if (!egg_desktop_file_can_launch (priv->desktop_file, current_desktop)) {
-                if (current_desktop) {
-                        g_debug ("app %s not installed or not for %s",
+        g_desktop_app_info_set_desktop_env (current_desktop);
+        if (current_desktop != NULL &&
+            !g_desktop_app_info_get_show_in (G_DESKTOP_APP_INFO (priv->app_info),
+                                             "GNOME") &&
+            !g_desktop_app_info_get_show_in (G_DESKTOP_APP_INFO (priv->app_info),
+                                             current_desktop)) {
+                        g_debug ("app %s not for %s",
                                  csm_app_peek_id (app), current_desktop);
-                } else {
-                        g_debug ("app %s not installed", csm_app_peek_id (app));
-                }
                 return TRUE;
         }
 
@@ -185,10 +179,6 @@ parse_condition_string (const char *condition_string,
                 kind = CSM_CONDITION_IF_EXISTS;
         } else if (!g_ascii_strncasecmp (condition_string, "unless-exists", len) && key) {
                 kind = CSM_CONDITION_UNLESS_EXISTS;
-#ifdef HAVE_GCONF
-        } else if (!g_ascii_strncasecmp (condition_string, "GNOME", len)) {
-                kind = CSM_CONDITION_GNOME;
-#endif
         } else if (!g_ascii_strncasecmp (condition_string, "GSettings", len)) {
                 kind = CSM_CONDITION_GSETTINGS;
         } else if (!g_ascii_strncasecmp (condition_string, "GNOME3", len)) {
@@ -282,40 +272,6 @@ unless_exists_condition_cb (GFileMonitor     *monitor,
                 g_signal_emit (app, signals[CONDITION_CHANGED], 0, condition);
         }
 }
-
-#ifdef HAVE_GCONF
-static void
-gconf_condition_cb (GConfClient *client,
-                    guint        cnxn_id,
-                    GConfEntry  *entry,
-                    gpointer     user_data)
-{
-        CsmApp                 *app;
-        CsmAutostartAppPrivate *priv;
-        gboolean                condition;
-
-        g_return_if_fail (CSM_IS_APP (user_data));
-
-        app = CSM_APP (user_data);
-
-        priv = CSM_AUTOSTART_APP (app)->priv;
-
-        condition = FALSE;
-        if (entry->value != NULL && entry->value->type == GCONF_VALUE_BOOL) {
-                condition = gconf_value_get_bool (entry->value);
-        }
-
-        g_debug ("CsmAutostartApp: app:%s condition changed condition:%d",
-                 csm_app_peek_id (app),
-                 condition);
-
-        /* Emit only if the condition actually changed */
-        if (condition != priv->condition) {
-                priv->condition = condition;
-                g_signal_emit (app, signals[CONDITION_CHANGED], 0, condition);
-        }
-}
-#endif
 
 static void
 gsettings_condition_cb (GSettings  *settings,
@@ -505,16 +461,6 @@ setup_condition_monitor (CsmAutostartApp *app)
                 g_file_monitor_cancel (app->priv->condition_monitor);
         }
 
-#ifdef HAVE_GCONF
-        if (app->priv->condition_notify_id > 0) {
-                GConfClient *client;
-                client = gconf_client_get_default ();
-                gconf_client_notify_remove (client,
-                                            app->priv->condition_notify_id);
-                app->priv->condition_notify_id = 0;
-        }
-#endif
-
         if (app->priv->condition_string == NULL) {
                 return;
         }
@@ -569,29 +515,6 @@ setup_condition_monitor (CsmAutostartApp *app)
 
                 g_object_unref (file);
                 g_free (file_path);
-#ifdef HAVE_GCONF
-        } else if (kind == CSM_CONDITION_GNOME) {
-                GConfClient *client;
-                char        *dir;
-
-                client = gconf_client_get_default ();
-                g_assert (GCONF_IS_CLIENT (client));
-
-                disabled = !gconf_client_get_bool (client, key, NULL);
-
-                dir = g_path_get_dirname (key);
-
-                gconf_client_add_dir (client,
-                                      dir,
-                                      GCONF_CLIENT_PRELOAD_NONE, NULL);
-                g_free (dir);
-
-                app->priv->condition_notify_id = gconf_client_notify_add (client,
-                                                                          key,
-                                                                          gconf_condition_cb,
-                                                                          app, NULL, NULL);
-                g_object_unref (client);
-#endif
         } else if (kind == CSM_CONDITION_GSETTINGS) {
                 disabled = !setup_gsettings_condition_monitor (app, key);
         } else if (kind == CSM_CONDITION_IF_SESSION) {
@@ -640,18 +563,19 @@ load_desktop_file (CsmAutostartApp *app)
         int      phase;
         gboolean res;
 
-        if (app->priv->desktop_file == NULL) {
+        if (app->priv->app_info == NULL) {
                 return FALSE;
         }
 
-        phase_str = egg_desktop_file_get_string (app->priv->desktop_file,
-                                                 CSM_AUTOSTART_APP_PHASE_KEY,
-                                                 NULL);
+        phase_str = g_desktop_app_info_get_string (app->priv->app_info,
+                                                   CSM_AUTOSTART_APP_PHASE_KEY);
         if (phase_str != NULL) {
                 if (strcmp (phase_str, "EarlyInitialization") == 0) {
                         phase = CSM_MANAGER_PHASE_EARLY_INITIALIZATION;
                 } else if (strcmp (phase_str, "PreDisplayServer") == 0) {
                         phase = CSM_MANAGER_PHASE_PRE_DISPLAY_SERVER;
+                } else if (strcmp (phase_str, "DisplayServer") == 0) {
+                        phase = CSM_MANAGER_PHASE_DISPLAY_SERVER;
                 } else if (strcmp (phase_str, "Initialization") == 0) {
                         phase = CSM_MANAGER_PHASE_INITIALIZATION;
                 } else if (strcmp (phase_str, "WindowManager") == 0) {
@@ -669,9 +593,8 @@ load_desktop_file (CsmAutostartApp *app)
                 phase = CSM_MANAGER_PHASE_APPLICATION;
         }
 
-        dbus_name = egg_desktop_file_get_string (app->priv->desktop_file,
-                                                 CSM_AUTOSTART_APP_DBUS_NAME_KEY,
-                                                 NULL);
+        dbus_name = g_desktop_app_info_get_string (app->priv->app_info,
+                                                   CSM_AUTOSTART_APP_DBUS_NAME_KEY);
         if (dbus_name != NULL) {
                 app->priv->launch_type = AUTOSTART_LAUNCH_ACTIVATE;
         } else {
@@ -682,9 +605,8 @@ load_desktop_file (CsmAutostartApp *app)
         switch (app->priv->launch_type) {
         case AUTOSTART_LAUNCH_SPAWN:
                 startup_id =
-                        egg_desktop_file_get_string (app->priv->desktop_file,
-                                                     CSM_AUTOSTART_APP_STARTUP_ID_KEY,
-                                                     NULL);
+                        g_desktop_app_info_get_string (app->priv->app_info,
+                                                       CSM_AUTOSTART_APP_STARTUP_ID_KEY);
 
                 if (startup_id == NULL) {
                         startup_id = csm_util_generate_startup_id ();
@@ -697,37 +619,36 @@ load_desktop_file (CsmAutostartApp *app)
                 g_assert_not_reached ();
         }
 
-        res = egg_desktop_file_has_key (app->priv->desktop_file,
-                                        CSM_AUTOSTART_APP_AUTORESTART_KEY,
-                                        NULL);
+        res = g_desktop_app_info_has_key (app->priv->app_info,
+                                          CSM_AUTOSTART_APP_AUTORESTART_KEY);
         if (res) {
-                app->priv->autorestart = egg_desktop_file_get_boolean (app->priv->desktop_file,
-                                                                       CSM_AUTOSTART_APP_AUTORESTART_KEY,
-                                                                       NULL);
+                app->priv->autorestart = g_desktop_app_info_get_boolean (app->priv->app_info,
+                                                                         CSM_AUTOSTART_APP_AUTORESTART_KEY);
         } else {
                 app->priv->autorestart = FALSE;
         }
 
         g_free (app->priv->condition_string);
-        app->priv->condition_string = egg_desktop_file_get_string (app->priv->desktop_file,
-                                                                   "AutostartCondition",
-                                                                   NULL);
+        app->priv->condition_string = g_desktop_app_info_get_string (app->priv->app_info,
+                                                                   "AutostartCondition");
         setup_condition_monitor (app);
 
         if (phase == CSM_MANAGER_PHASE_APPLICATION) {
-                /* Only accept an autostart delay for the application phase */
-                app->priv->autostart_delay = egg_desktop_file_get_integer (app->priv->desktop_file,
-                                                                           CSM_AUTOSTART_APP_DELAY_KEY,
-                                                                           NULL);
-                if (app->priv->autostart_delay < 0) {
-                        g_warning ("Invalid autostart delay of %d for %s", app->priv->autostart_delay,
-                                   csm_app_peek_id (CSM_APP (app)));
-                        app->priv->autostart_delay = -1;
-                }
+            /* Only accept an autostart delay for the application phase */
+            const char *delay;
+            delay = g_desktop_app_info_get_string (app->priv->app_info,
+                                                   CSM_AUTOSTART_APP_DELAY_KEY);
 
-                app->priv->working_dir = egg_desktop_file_get_string (app->priv->desktop_file,
-                                                                      EGG_DESKTOP_FILE_KEY_PATH,
-                                                                      NULL);
+            if (delay != NULL) {
+                    app->priv->autostart_delay = strtol (delay, NULL, 10);
+
+                    if (app->priv->autostart_delay < 0) {
+                            g_warning ("Invalid autostart delay of %d for %s",
+                                       app->priv->autostart_delay,
+                                       csm_app_peek_id (CSM_APP (app)));
+                            app->priv->autostart_delay = -1;
+                    }
+            }
         }
 
         g_object_set (app,
@@ -750,14 +671,12 @@ csm_autostart_app_initable_init (GInitable *initable,
 
         g_return_val_if_fail (app->priv->desktop_filename != NULL, FALSE);
 
-        if (app->priv->desktop_file != NULL) {
-                egg_desktop_file_free (app->priv->desktop_file);
-                app->priv->desktop_file = NULL;
-        }
+        g_clear_object (&app->priv->app_info);
 
-        app->priv->desktop_file = egg_desktop_file_new (app->priv->desktop_filename,
-                                                        error);
-        if (app->priv->desktop_file == NULL) {
+        app->priv->app_info = g_desktop_app_info_new_from_filename (app->priv->desktop_filename);
+        if (app->priv->app_info == NULL) {
+                g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                             "Could not parse desktop file %s or it references a not found TryExec binary", app->priv->desktop_id);
                 return FALSE;
         }
 
@@ -770,8 +689,8 @@ static void
 csm_autostart_app_set_desktop_filename (CsmAutostartApp *app,
                                         const char      *desktop_filename)
 {
-        if (app->priv->desktop_file != NULL) {
-                g_clear_pointer (&app->priv->desktop_file, egg_desktop_file_free);
+        if (app->priv->app_info != NULL) {
+                g_clear_object (&app->priv->app_info);
                 g_clear_pointer (&app->priv->desktop_id, g_free);
                 g_clear_pointer (&app->priv->desktop_filename, g_free);
         }
@@ -816,8 +735,8 @@ csm_autostart_app_get_property (GObject    *object,
 
         switch (prop_id) {
         case PROP_DESKTOP_FILENAME:
-                if (self->priv->desktop_file != NULL) {
-                        g_value_set_string (value, egg_desktop_file_get_source (self->priv->desktop_file));
+                if (self->priv->app_info != NULL) {
+                        g_value_set_string (value, g_desktop_app_info_get_filename (self->priv->app_info));
                 } else {
                         g_value_set_string (value, NULL);
                 }
@@ -855,10 +774,7 @@ csm_autostart_app_dispose (GObject *object)
                 priv->condition_settings = NULL;
         }
 
-        if (priv->desktop_file) {
-                egg_desktop_file_free (priv->desktop_file);
-                priv->desktop_file = NULL;
-        }
+        g_clear_object (&priv->app_info);
 
         if (priv->desktop_id) {
                 g_free (priv->desktop_id);
@@ -935,14 +851,6 @@ is_conditionally_disabled (CsmApp *app)
                 file_path = g_build_filename (g_get_user_config_dir (), key, NULL);
                 disabled = g_file_test (file_path, G_FILE_TEST_EXISTS);
                 g_free (file_path);
-#ifdef HAVE_GCONF
-        } else if (kind == CSM_CONDITION_GNOME) {
-                GConfClient *client;
-                client = gconf_client_get_default ();
-                g_assert (GCONF_IS_CLIENT (client));
-                disabled = !gconf_client_get_bool (client, key, NULL);
-                g_object_unref (client);
-#endif
         } else if (kind == CSM_CONDITION_GSETTINGS &&
                    priv->condition_settings != NULL) {
                 char **elems;
@@ -1076,7 +984,7 @@ csm_autostart_app_stop (CsmApp  *app,
 
         aapp = CSM_AUTOSTART_APP (app);
 
-        g_return_val_if_fail (aapp->priv->desktop_file != NULL, FALSE);
+        g_return_val_if_fail (aapp->priv->app_info != NULL, FALSE);
 
         switch (aapp->priv->launch_type) {
         case AUTOSTART_LAUNCH_SPAWN:
@@ -1093,53 +1001,67 @@ csm_autostart_app_stop (CsmApp  *app,
         return ret;
 }
 
+static void
+app_launched (GAppLaunchContext *ctx,
+              GAppInfo    *appinfo,
+              GVariant    *platform_data,
+              gpointer     data)
+{
+        CsmAutostartApp *app = data;
+        CsmAutostartAppPrivate *priv = app->priv;
+        gint pid;
+        gchar *sn_id;
+
+        pid = 0;
+        sn_id = NULL;
+
+        g_variant_lookup (platform_data, "pid", "i", &pid);
+        g_variant_lookup (platform_data, "startup-notification-id", "s", &sn_id);
+        priv->pid = pid;
+        priv->startup_id = sn_id;
+}
+
 static gboolean
 autostart_app_start_spawn (CsmAutostartApp *app,
                            GError         **error)
 {
-        char            *env[2] = { NULL, NULL };
         gboolean         success;
         GError          *local_error;
         const char      *startup_id;
-        char            *command;
+        GAppLaunchContext *ctx;
+        guint            handler;
 
         startup_id = csm_app_peek_startup_id (CSM_APP (app));
         g_assert (startup_id != NULL);
 
-        env[0] = g_strdup_printf ("DESKTOP_AUTOSTART_ID=%s", startup_id);
-
-        local_error = NULL;
-        command = egg_desktop_file_parse_exec (app->priv->desktop_file,
-                                               NULL,
-                                               &local_error);
-        if (command == NULL) {
-                g_warning ("Unable to parse command from  '%s': %s",
-                           egg_desktop_file_get_source (app->priv->desktop_file),
-                           local_error->message);
-                g_error_free (local_error);
-        }
-
-        g_debug ("CsmAutostartApp: starting %s: command=%s startup-id=%s", app->priv->desktop_id, command, startup_id);
-        g_free (command);
+        g_debug ("CsmAutostartApp: starting %s: command=%s startup-id=%s", app->priv->desktop_id, g_app_info_get_commandline (G_APP_INFO (app->priv->app_info)), startup_id);
 
         g_free (app->priv->startup_id);
         local_error = NULL;
-        success = egg_desktop_file_launch (app->priv->desktop_file,
-                                           NULL,
-                                           &local_error,
-                                           EGG_DESKTOP_FILE_LAUNCH_PUTENV, env,
-                                           EGG_DESKTOP_FILE_LAUNCH_FLAGS, G_SPAWN_DO_NOT_REAP_CHILD,
-                                           EGG_DESKTOP_FILE_LAUNCH_RETURN_PID, &app->priv->pid,
-                                           EGG_DESKTOP_FILE_LAUNCH_RETURN_STARTUP_ID, &app->priv->startup_id,
-                                           EGG_DESKTOP_FILE_LAUNCH_DIRECTORY, app->priv->working_dir,
-                                           NULL);
-        g_free (env[0]);
+
+        ctx = g_app_launch_context_new ();
+
+        if  (startup_id != NULL) {
+            g_app_launch_context_setenv (ctx, "DESKTOP_AUTOSTART_ID", startup_id);
+        }
+
+        handler = g_signal_connect (ctx, "launched", G_CALLBACK (app_launched), app);
+        success = g_desktop_app_info_launch_uris_as_manager (app->priv->app_info,
+                                                             NULL,
+                                                             ctx,
+                                                             G_SPAWN_DO_NOT_REAP_CHILD | G_SPAWN_SEARCH_PATH,
+                                                             NULL, NULL,
+                                                             NULL, NULL,
+                                                             &local_error);
+        g_signal_handler_disconnect (ctx, handler);
 
         if (success) {
-                g_debug ("CsmAutostartApp: started pid:%d", app->priv->pid);
-                app->priv->child_watch_id = g_child_watch_add (app->priv->pid,
-                                                               (GChildWatchFunc)app_exited,
-                                                               app);
+                if (app->priv->pid > 0) {
+                        g_debug ("CsmAutostartApp: started pid:%d", app->priv->pid);
+                        app->priv->child_watch_id = g_child_watch_add (app->priv->pid,
+                                                                       (GChildWatchFunc)app_exited,
+                                                                       app);
+                }
         } else {
                 g_set_error (error,
                              CSM_APP_ERROR,
@@ -1195,17 +1117,15 @@ autostart_app_start_activate (CsmAutostartApp  *app,
         name = csm_app_peek_startup_id (CSM_APP (app));
         g_assert (name != NULL);
 
-        path = egg_desktop_file_get_string (app->priv->desktop_file,
-                                            CSM_AUTOSTART_APP_DBUS_PATH_KEY,
-                                            NULL);
+        path = g_desktop_app_info_get_string (app->priv->app_info,
+                                              CSM_AUTOSTART_APP_DBUS_PATH_KEY);
         if (path == NULL) {
                 /* just pick one? */
                 path = g_strdup ("/");
         }
 
-        arguments = egg_desktop_file_get_string (app->priv->desktop_file,
-                                                 CSM_AUTOSTART_APP_DBUS_ARGS_KEY,
-                                                 NULL);
+        arguments = g_desktop_app_info_get_string (app->priv->app_info,
+                                                   CSM_AUTOSTART_APP_DBUS_ARGS_KEY);
 
         g_dbus_connection_call (bus,
                                 name,
@@ -1232,7 +1152,7 @@ csm_autostart_app_start (CsmApp  *app,
 
         aapp = CSM_AUTOSTART_APP (app);
 
-        g_return_val_if_fail (aapp->priv->desktop_file != NULL, FALSE);
+        g_return_val_if_fail (aapp->priv->app_info != NULL, FALSE);
 
         switch (aapp->priv->launch_type) {
         case AUTOSTART_LAUNCH_SPAWN:
@@ -1277,8 +1197,8 @@ static gboolean
 csm_autostart_app_provides (CsmApp     *app,
                             const char *service)
 {
+        gchar           *provides_str;
         char           **provides;
-        gsize            len;
         gsize            i;
         GSList          *l;
         CsmAutostartApp *aapp;
@@ -1287,7 +1207,7 @@ csm_autostart_app_provides (CsmApp     *app,
 
         aapp = CSM_AUTOSTART_APP (app);
 
-        if (aapp->priv->desktop_file == NULL) {
+        if (aapp->priv->app_info == NULL) {
                 return FALSE;
         }
 
@@ -1296,14 +1216,15 @@ csm_autostart_app_provides (CsmApp     *app,
                         return TRUE;
         }
 
-        provides = egg_desktop_file_get_string_list (aapp->priv->desktop_file,
-                                                     CSM_AUTOSTART_APP_PROVIDES_KEY,
-                                                     &len, NULL);
-        if (!provides) {
+        provides_str = g_desktop_app_info_get_string (aapp->priv->app_info,
+                                                      CSM_AUTOSTART_APP_PROVIDES_KEY);
+        if (!provides_str) {
                 return FALSE;
         }
+        provides = g_strsplit (provides_str, ";", -1);
+        g_free (provides_str);
 
-        for (i = 0; i < len; i++) {
+        for (i = 0; provides[i]; i++) {
                 if (!strcmp (provides[i], service)) {
                         g_strfreev (provides);
                         return TRUE;
@@ -1319,6 +1240,7 @@ static char **
 csm_autostart_app_get_provides (CsmApp *app)
 {
         CsmAutostartApp  *aapp;
+        gchar            *provides_str;
         char            **provides;
         gsize             provides_len;
         char            **result;
@@ -1330,19 +1252,27 @@ csm_autostart_app_get_provides (CsmApp *app)
 
         aapp = CSM_AUTOSTART_APP (app);
 
-        if (aapp->priv->desktop_file == NULL) {
+        if (aapp->priv->app_info == NULL) {
                 return NULL;
         }
 
-        provides = egg_desktop_file_get_string_list (aapp->priv->desktop_file,
-                                                     CSM_AUTOSTART_APP_PROVIDES_KEY,
-                                                     &provides_len, NULL);
+        provides_str = g_desktop_app_info_get_string (aapp->priv->app_info,
+                                                      CSM_AUTOSTART_APP_PROVIDES_KEY);
 
-        if (!aapp->priv->session_provides)
+        if (provides_str == NULL) {
+                return NULL;
+        }
+
+        provides = g_strsplit (provides_str, ";", -1);
+        provides_len = g_strv_length (provides);
+        g_free (provides_str);
+
+        if (!aapp->priv->session_provides) {
                 return provides;
+        }
 
         result_len = provides_len + g_slist_length (aapp->priv->session_provides);
-	result = g_new (char *, result_len + 1); /* including last NULL */
+        result = g_new (char *, result_len + 1); /* including last NULL */
 
         for (i = 0; provides[i] != NULL; i++)
                 result[i] = provides[i];
@@ -1396,19 +1326,17 @@ csm_autostart_app_get_autorestart (CsmApp *app)
         gboolean res;
         gboolean autorestart;
 
-        if (CSM_AUTOSTART_APP (app)->priv->desktop_file == NULL) {
+        if (CSM_AUTOSTART_APP (app)->priv->app_info == NULL) {
                 return FALSE;
         }
 
         autorestart = FALSE;
 
-        res = egg_desktop_file_has_key (CSM_AUTOSTART_APP (app)->priv->desktop_file,
-                                        CSM_AUTOSTART_APP_AUTORESTART_KEY,
-                                        NULL);
+        res = g_desktop_app_info_has_key (CSM_AUTOSTART_APP (app)->priv->app_info,
+                                          CSM_AUTOSTART_APP_AUTORESTART_KEY);
         if (res) {
-                autorestart = egg_desktop_file_get_boolean (CSM_AUTOSTART_APP (app)->priv->desktop_file,
-                                                            CSM_AUTOSTART_APP_AUTORESTART_KEY,
-                                                            NULL);
+                autorestart = g_desktop_app_info_get_boolean (CSM_AUTOSTART_APP (app)->priv->app_info,
+                                                              CSM_AUTOSTART_APP_AUTORESTART_KEY);
         }
 
         return autorestart;
@@ -1420,11 +1348,11 @@ csm_autostart_app_get_app_id (CsmApp *app)
         const char *location;
         const char *slash;
 
-        if (CSM_AUTOSTART_APP (app)->priv->desktop_file == NULL) {
+        if (CSM_AUTOSTART_APP (app)->priv->app_info == NULL) {
                 return NULL;
         }
 
-        location = egg_desktop_file_get_source (CSM_AUTOSTART_APP (app)->priv->desktop_file);
+        location = g_desktop_app_info_get_filename (CSM_AUTOSTART_APP (app)->priv->app_info);
 
         slash = strrchr (location, '/');
         if (slash != NULL) {

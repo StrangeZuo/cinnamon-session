@@ -27,16 +27,12 @@ foreach iface: gdbus_ifaces
 endforeach
 
 cinnamon_session_sources = [
-  'cs-idle-monitor.c',
   'csm-app.c',
   'csm-autostart-app.c',
   'csm-client.c',
   'csm-consolekit.c',
   'csm-dbus-client.c',
-  'csm-fail-whale-dialog.c',
-  'csm-inhibit-dialog.c',
   'csm-inhibitor.c',
-  'csm-logout-dialog.c',
   'csm-manager.c',
   'csm-presence.c',
   'csm-process-helper.c',
@@ -48,6 +44,7 @@ cinnamon_session_sources = [
   'csm-util.c',
   'csm-xsmp-client.c',
   'csm-xsmp-server.c',
+  'inhibit-dialog-info.c',
   'main.c',
   'mdm-log.c',
   'mdm-signal-handler.c',
@@ -56,11 +53,11 @@ cinnamon_session_sources = [
   gdbus_sources,
 ]
 
-executable('cinnamon-session',
+executable('cinnamon-session-binary',
   cinnamon_session_sources,
   dependencies: [
+    cinnamon_desktop,
     execinfo,
-    gconf,
     gio,
     glib,
     gtk3,
@@ -76,11 +73,20 @@ executable('cinnamon-session',
     xtest,
     elogind,
   ],
-  link_with: [
-    libegg,
-  ],
-  include_directories: [ rootInclude, eggInclude, ],
+  include_directories: [ rootInclude ],
   install: true,
+  install_dir: get_option('libexecdir'),
+)
+
+script_conf = configuration_data()
+script_conf.set('libexecdir', get_option('prefix') / get_option('libexecdir'))
+
+configure_file(
+  input: 'cinnamon-session.in',
+  output: 'cinnamon-session',
+  install: true,
+  install_dir: get_option('bindir'),
+  configuration: script_conf
 )
 
 units = [

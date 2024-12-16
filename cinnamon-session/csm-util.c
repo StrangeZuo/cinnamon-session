@@ -30,17 +30,57 @@
 #include <glib.h>
 #include <glib/gi18n.h>
 #include <glib/gstdio.h>
-#include <gtk/gtk.h>
+#include <gio/gio.h>
 
 #include "csm-util.h"
 
 static gchar *_saved_session_dir = NULL;
 
+/* These are variables that will not be passed on to subprocesses
+ * (either directly, via systemd or DBus).
+ * Some of these are blacklisted as they might end up in the wrong session
+ * (e.g. XDG_VTNR), others because they simply must never be passed on
+ * (NOTIFY_SOCKET).
+ */
 static const char * const variable_blacklist[] = {
     "NOTIFY_SOCKET",
     "XDG_SEAT",
     "XDG_SESSION_ID",
     "XDG_VTNR",
+
+    /* None of the LC_* variables should survive a logout/login */
+    "LC_CTYPE",
+    "LC_NUMERIC",
+    "LC_TIME",
+    "LC_COLLATE",
+    "LC_MONETARY",
+    "LC_MESSAGES",
+    "LC_PAPER",
+    "LC_NAME",
+    "LC_ADDRESS",
+    "LC_TELEPHONE",
+    "LC_MEASUREMENT",
+    "LC_IDENTIFICATION",
+    "LC_ALL",
+
+    NULL
+};
+
+/* The following is copied from GDMs spawn_session function.
+ *
+ * Environment variables listed here will be copied into the user's service
+ * environments if they are set in gnome-session's environment. If they are
+ * not set in gnome-session's environment, they will be removed from the
+ * service environments. This is to protect against environment variables
+ * leaking from previous sessions (e.g. when switching from classic to
+ * default GNOME $GNOME_SHELL_SESSION_MODE will become unset).
+ */
+static const char * const variable_unsetlist[] = {
+    "DISPLAY",
+    "XAUTHORITY",
+    "WAYLAND_DISPLAY",
+    "WAYLAND_SOCKET",
+    "GNOME_SHELL_SESSION_MODE",
     NULL
 };
 
@@ -400,52 +440,21 @@ csm_util_text_is_blank (const char *str)
  * itself, since no window manager will be running yet.)
  **/
 void
-csm_util_init_error (gboolean    fatal,
+csm_util_init_error (gboolean    kill_session,
                      const char *format, ...)
 {
-        GtkButtonsType  buttons;
-        GtkWidget      *dialog;
-        char           *msg;
+        gchar           *msg;
         va_list         args;
 
         va_start (args, format);
         msg = g_strdup_vprintf (format, args);
         va_end (args);
 
-        /* If option parsing failed, Gtk won't have been initialized... */
-        if (!gdk_display_get_default ()) {
-                if (!gtk_init_check (NULL, NULL)) {
-                        /* Oh well, no X for you! */
-                        g_printerr (_("Unable to start login session (and unable to connect to the X server)"));
-                        g_printerr ("%s", msg);
-                        exit (1);
-                }
-        }
 
-        if (fatal)
-                buttons = GTK_BUTTONS_NONE;
-        else
-                buttons = GTK_BUTTONS_CLOSE;
+        g_critical ("Unable to start session: %s", msg);
 
-        dialog = gtk_message_dialog_new (NULL, 0, GTK_MESSAGE_ERROR,
-                                         buttons, "%s", msg);
-
-        if (fatal)
-                gtk_dialog_add_button (GTK_DIALOG (dialog),
-                                       _("_Log Out"), GTK_RESPONSE_CLOSE);
-
-        g_free (msg);
-
-        gtk_window_set_position (GTK_WINDOW (dialog), GTK_WIN_POS_CENTER);
-        gtk_dialog_run (GTK_DIALOG (dialog));
-
-        gtk_widget_destroy (dialog);
-
-        if (fatal) {
-                if (gtk_main_level () > 0)
-                        gtk_main_quit ();
-                else
-                        exit (1);
+        if (kill_session) {
+                csm_quit ();
         }
 }
 
@@ -656,10 +665,19 @@ csm_util_export_user_environment (GError     **error)
 
         entries = g_get_environ ();
 
-        for (; variable_blacklist[i] != NULL; i++)
+        for (i = 0; variable_blacklist[i] != NULL; i++)
                 entries = g_environ_unsetenv (entries, variable_blacklist[i]);
 
-        g_variant_builder_init (&builder, G_VARIANT_TYPE ("as"));
+        g_variant_builder_init (&builder, G_VARIANT_TYPE ("(asas)"));
+
+        g_variant_builder_open (&builder, G_VARIANT_TYPE ("as"));
+        for (i = 0; variable_unsetlist[i] != NULL; i++)
+                g_variant_builder_add (&builder, "s", variable_unsetlist[i]);
+        for (i = 0; variable_blacklist[i] != NULL; i++)
+                g_variant_builder_add (&builder, "s", variable_blacklist[i]);
+        g_variant_builder_close (&builder);
+
+        g_variant_builder_open (&builder, G_VARIANT_TYPE ("as"));
         for (i = 0; entries[i] != NULL; i++) {
                 const char *entry = entries[i];
 
@@ -671,6 +689,7 @@ csm_util_export_user_environment (GError     **error)
 
                 g_variant_builder_add (&builder, "s", entry);
         }
+        g_variant_builder_close (&builder);
         g_regex_unref (regex);
 
         g_strfreev (entries);
@@ -679,9 +698,8 @@ csm_util_export_user_environment (GError     **error)
                                              "org.freedesktop.systemd1",
                                              "/org/freedesktop/systemd1",
                                              "org.freedesktop.systemd1.Manager",
-                                             "SetEnvironment",
-                                             g_variant_new ("(@as)",
-                                                            g_variant_builder_end (&builder)),
+                                             "UnsetAndSetEnvironment",
+                                             g_variant_builder_end (&builder),
                                              NULL,
                                              G_DBUS_CALL_FLAGS_NONE,
                                              -1, NULL, &bus_error);
@@ -767,15 +785,4 @@ csm_util_setenv (const char *variable,
                 g_debug ("Could not make systemd aware of %s=%s environment variable: %s", variable, value, error->message);
                 g_clear_error (&error);
         }
-}
-
-GtkIconSize
-csm_util_get_computer_fail_icon_size (void)
-{
-        static GtkIconSize icon_size = 0;
-
-        if (icon_size == 0)
-                icon_size = gtk_icon_size_register ("cinnamon-session-computer-fail", 128, 128);
-
-        return icon_size;
 }
